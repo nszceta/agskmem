@@ -108,6 +108,17 @@ fn mcp_recall_outputs_are_compact_by_default() {
         json!({"query": "compact MCP recall", "limit": 5}),
     )
     .expect("mcp recall");
+    assert_eq!(
+        recall["prompt"].as_str(),
+        Some("recall_memory query=\"compact MCP recall\"; limit=5")
+    );
+    let recall_text = recall["results_text"].as_str().expect("results text");
+    assert!(
+        recall_text.contains("Compact MCP recall should preserve the useful memory text."),
+        "{recall_text}"
+    );
+    assert!(recall_text.contains("tags: compact-mcp"), "{recall_text}");
+    assert_eq!(recall["result_count"], 1);
     let recall_memory = recall["results"]
         .as_array()
         .expect("recall results")
@@ -119,6 +130,12 @@ fn mcp_recall_outputs_are_compact_by_default() {
 
     let startup =
         agskmem::mcp::call_tool(&app, "startup_recall", json!({"limit": 5})).expect("mcp startup");
+    assert_eq!(startup["prompt"].as_str(), Some("startup_recall limit=5"));
+    let startup_text = startup["results_text"].as_str().expect("startup text");
+    assert!(
+        startup_text.contains("Compact MCP recall should preserve the useful memory text."),
+        "{startup_text}"
+    );
     let startup_memory = startup["results"]
         .as_array()
         .expect("startup results")
@@ -133,6 +150,16 @@ fn mcp_recall_outputs_are_compact_by_default() {
         json!({"query": "compact MCP recall", "limit": 5}),
     )
     .expect("mcp trace");
+    assert_eq!(
+        trace["trace"]["prompt"].as_str(),
+        Some("recall_memory query=\"compact MCP recall\"; limit=5")
+    );
+    assert!(
+        trace["trace"]["results_text"]
+            .as_str()
+            .expect("trace text")
+            .contains("Compact MCP recall should preserve the useful memory text.")
+    );
     let trace_memory = trace["trace"]["results"]
         .as_array()
         .expect("trace results")
@@ -141,7 +168,6 @@ fn mcp_recall_outputs_are_compact_by_default() {
     assert!(trace_memory.get("metadata").is_none());
     assert!(trace_memory.get("components").is_some());
 }
-
 #[test]
 fn empty_optional_ids_are_treated_as_absent() {
     let (_tmp, app) = app();
