@@ -2,7 +2,9 @@ use crate::{
     config::Config,
     db::Database,
     design_types::*,
-    embed::{self, Embedder, LocalHashEmbedder},
+    embed::{
+        self, Embedder, EmbeddingBatch, FastEmbedBgeM3Embedder, LocalHashEmbedder, SparseVector,
+    },
     graph::{Graph, GraphStore},
     model::{
         MemoryRow, MemoryType, RecallHit, RelationKind, ScoreComponents, clamp_unit,
@@ -48,13 +50,22 @@ pub struct DeleteResult {
     pub ids: Vec<String>,
 }
 
+fn build_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
+    match config.embed.provider.trim().to_ascii_lowercase().as_str() {
+        "local" | "local-hash" => Ok(Arc::new(LocalHashEmbedder::new(
+            config.embed.model.clone(),
+            config.embed.dims,
+        ))),
+        "fastembed" | "fastembed-bgem3" | "bge-m3" | "bgem3" => Ok(Arc::new(
+            FastEmbedBgeM3Embedder::new(config.embed.model.clone(), config.embed.dims)?,
+        )),
+        other => bail!("unsupported embed.provider {other}"),
+    }
+}
 impl AgskMem {
     pub fn open(config: Config) -> anyhow::Result<Self> {
         let db = Database::open(config.db.path.clone())?;
-        let embedder: Arc<dyn Embedder> = Arc::new(LocalHashEmbedder::new(
-            config.embed.model.clone(),
-            config.embed.dims,
-        ));
+        let embedder = build_embedder(&config)?;
         let app = Self {
             config,
             db,
@@ -442,7 +453,30 @@ impl AgskMem {
         } else {
             Vec::new()
         };
+        let mut query_batch = self.embedder.embed_for_recall(&[query])?;
+        let query_vec = query_batch.dense.pop().unwrap_or_default();
+        let query_sparse = query_batch.sparse.pop().unwrap_or_default();
+        let query_colbert = query_batch.colbert.pop().unwrap_or_default();
+        let query_embedding = QueryEmbedding {
+            dense: &query_vec,
+            sparse: &query_sparse,
+            colbert: &query_colbert,
+        };
+
         let mut candidate_ids = HashSet::new();
+        let sparse_scores =
+            sparse_candidates(&conn, &query_sparse, self.config.recall.per_source_limit)?;
+        for id in sparse_scores.keys() {
+            candidate_ids.insert(id.clone());
+        }
+        for id in vector_candidates(
+            &conn,
+            &query_vec,
+            self.embedder.model(),
+            self.config.recall.per_source_limit,
+        )? {
+            candidate_ids.insert(id);
+        }
         for id in fts_candidates(&conn, query, self.config.recall.per_source_limit)? {
             candidate_ids.insert(id);
         }
@@ -471,11 +505,6 @@ impl AgskMem {
             candidate_ids.insert(id.clone());
         }
 
-        let query_vec = self
-            .embedder
-            .embed_for_recall(&[query])
-            .pop()
-            .unwrap_or_default();
         let graph = self.graph.load();
         let (time_query_start, time_query_end) = time_query_bounds(args.time_query.as_deref())?;
         let start_bound = args.start.as_deref().or(time_query_start.as_deref());
@@ -498,7 +527,14 @@ impl AgskMem {
             let Some(memory) = fetch_memory_row(&conn, &id, false, now)? else {
                 continue;
             };
-            let components = compute_components(&conn, &memory, query, &query_vec, &context_tags)?;
+            let components = compute_components(
+                &conn,
+                &memory,
+                query,
+                &query_embedding,
+                sparse_scores.get(&id).copied(),
+                &context_tags,
+            )?;
             let score = score_components(&self.config.recall.weights, &components);
             if score > 0.0 || args.priority_ids.contains(&id) {
                 seed_scores.insert(id.clone(), score.max(0.01) as f32);
@@ -530,8 +566,14 @@ impl AgskMem {
                 {
                     continue;
                 }
-                let mut components =
-                    compute_components(&conn, &memory, query, &query_vec, &context_tags)?;
+                let mut components = compute_components(
+                    &conn,
+                    &memory,
+                    query,
+                    &query_embedding,
+                    sparse_scores.get(id).copied(),
+                    &context_tags,
+                )?;
                 components.ppr = f64::from(*ppr.get(id).unwrap_or(&0.0));
                 let score = score_components(&self.config.recall.weights, &components);
                 raw.push((id.clone(), memory, components, score));
@@ -626,6 +668,8 @@ impl AgskMem {
             "statement",
             "embedding",
             "embedding_job",
+            "embedding_sparse",
+            "embedding_colbert",
             "enrichment_job",
             "classification_cache",
         ];
@@ -640,11 +684,13 @@ impl AgskMem {
             );
         }
         let missing_embeddings: i64 = conn.query_row("SELECT COUNT(*) FROM memory m LEFT JOIN embedding e ON e.memory_id = m.id WHERE e.memory_id IS NULL", [], |row| row.get(0))?;
+        let missing_sparse_embeddings: i64 = conn.query_row("SELECT COUNT(*) FROM memory m LEFT JOIN embedding_sparse e ON e.memory_id = m.id WHERE e.memory_id IS NULL", [], |row| row.get(0))?;
+        let missing_colbert_embeddings: i64 = conn.query_row("SELECT COUNT(*) FROM memory m LEFT JOIN embedding_colbert e ON e.memory_id = m.id WHERE e.memory_id IS NULL", [], |row| row.get(0))?;
         let pending_jobs: i64 =
             conn.query_row("SELECT COUNT(*) FROM embedding_job", [], |row| row.get(0))?;
         let graph = self.graph.load().stats();
         Ok(
-            json!({"ok": true, "path": self.db_path(), "counts": counts, "missing_embeddings": missing_embeddings, "pending_jobs": pending_jobs, "graph": graph}),
+            json!({"ok": true, "path": self.db_path(), "counts": counts, "missing_embeddings": missing_embeddings, "missing_sparse_embeddings": missing_sparse_embeddings, "missing_colbert_embeddings": missing_colbert_embeddings, "pending_jobs": pending_jobs, "graph": graph}),
         )
     }
 
@@ -868,7 +914,7 @@ impl AgskMem {
 
     pub fn reembed(&self, args: ReembedArgs) -> anyhow::Result<Value> {
         let conn = self.db.read_connection()?;
-        let ids = if let Some(id) = args.memory_id {
+        let ids = if let Some(id) = non_empty_string(args.memory_id) {
             vec![id]
         } else if !args.tags.is_empty() {
             self.ids_for_tags(&normalize_tags(&args.tags))?
@@ -882,11 +928,18 @@ impl AgskMem {
         let tx = writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_epoch();
         for id in &ids {
-            let content: String =
-                tx.query_row("SELECT content FROM memory WHERE id = ?", [id], |row| {
-                    row.get(0)
-                })?;
-            upsert_embedding(&tx, &*self.embedder, id, &content, now)?;
+            let (content, summary): (String, Option<String>) = tx.query_row(
+                "SELECT content, summary FROM memory WHERE id = ?",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            upsert_embedding(
+                &tx,
+                &*self.embedder,
+                id,
+                &embedding_text(&content, summary.as_deref()),
+                now,
+            )?;
         }
         tx.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('embedding_model', ?)",
@@ -1128,10 +1181,23 @@ fn upsert_embedding(
     content: &str,
     now: i64,
 ) -> anyhow::Result<()> {
-    let vec = embedder
-        .embed_for_store(&[content])
+    let batch = embedder.embed_for_store(&[content])?;
+    persist_embedding_batch(tx, embedder, id, batch, now)?;
+    tx.execute("DELETE FROM embedding_job WHERE memory_id = ?", [id])?;
+    Ok(())
+}
+
+fn persist_embedding_batch(
+    tx: &Transaction<'_>,
+    embedder: &dyn Embedder,
+    id: &str,
+    mut batch: EmbeddingBatch,
+    now: i64,
+) -> anyhow::Result<()> {
+    let vec = batch
+        .dense
         .pop()
-        .context("embedder returned no vector")?;
+        .context("embedder returned no dense vector")?;
     if vec.len() != embedder.dims() {
         bail!(
             "embedder returned {} dims, expected {}",
@@ -1139,12 +1205,50 @@ fn upsert_embedding(
             embedder.dims()
         );
     }
+    let sparse = batch
+        .sparse
+        .pop()
+        .context("embedder returned no sparse vector")?;
+    if sparse.indices.len() != sparse.values.len() {
+        bail!(
+            "embedder returned sparse vector with {} indices and {} values",
+            sparse.indices.len(),
+            sparse.values.len()
+        );
+    }
+    let colbert = batch
+        .colbert
+        .pop()
+        .context("embedder returned no ColBERT vectors")?;
     let blob = embed::vector_to_blob(&vec);
     tx.execute("INSERT INTO embedding(memory_id, model, dims, norm, vec, created_at) VALUES (?, ?, ?, 1.0, ?, ?) ON CONFLICT(memory_id) DO UPDATE SET model=excluded.model, dims=excluded.dims, norm=excluded.norm, vec=excluded.vec, created_at=excluded.created_at", params![id, embedder.model(), embedder.dims() as i64, blob, now])?;
-    tx.execute("DELETE FROM embedding_job WHERE memory_id = ?", [id])?;
+    tx.execute("DELETE FROM embedding_sparse WHERE memory_id = ?", [id])?;
+    for (token_id, weight) in sparse.indices.iter().zip(sparse.values.iter()) {
+        let token_id = i64::try_from(*token_id).context("sparse token id exceeds sqlite i64")?;
+        tx.execute(
+            "INSERT INTO embedding_sparse(memory_id, token_id, weight) VALUES (?, ?, ?)",
+            params![id, token_id, *weight as f64],
+        )?;
+    }
+    tx.execute("DELETE FROM embedding_colbert WHERE memory_id = ?", [id])?;
+    for (token_index, vector) in colbert.iter().enumerate() {
+        if vector.len() != embedder.dims() {
+            bail!(
+                "embedder returned ColBERT vector {} with {} dims, expected {}",
+                token_index,
+                vector.len(),
+                embedder.dims()
+            );
+        }
+        let token_index =
+            i64::try_from(token_index).context("ColBERT token index exceeds sqlite i64")?;
+        tx.execute(
+            "INSERT INTO embedding_colbert(memory_id, token_index, vec) VALUES (?, ?, ?)",
+            params![id, token_index, embed::vector_to_blob(vector)],
+        )?;
+    }
     Ok(())
 }
-
 fn enrich_memory(
     tx: &Transaction<'_>,
     id: &str,
@@ -1477,6 +1581,12 @@ struct FilterSpec<'a> {
     time_range: Option<&'a TimeRange>,
 }
 
+struct QueryEmbedding<'a> {
+    dense: &'a [f32],
+    sparse: &'a SparseVector,
+    colbert: &'a [Vec<f32>],
+}
+
 fn passes_filters(conn: &Connection, id: &str, filters: &FilterSpec<'_>) -> anyhow::Result<bool> {
     if filters.current_only && !is_active(conn, id, filters.as_of)? {
         return Ok(false);
@@ -1512,6 +1622,67 @@ fn passes_filters(conn: &Connection, id: &str, filters: &FilterSpec<'_>) -> anyh
         }
     }
     Ok(true)
+}
+
+fn vector_candidates(
+    conn: &Connection,
+    query_vec: &[f32],
+    model: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<String>> {
+    if query_vec.is_empty() || query_vec.iter().all(|v| *v == 0.0) || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let query_blob = embed::vector_to_blob(query_vec);
+    let mut stmt = conn.prepare(
+        "SELECT memory_id FROM (
+            SELECT memory_id, cosine(?1, vec) AS score
+            FROM embedding
+            WHERE model = ?2 AND dims = ?3
+        )
+        WHERE score > 0.0
+        ORDER BY score DESC, memory_id
+        LIMIT ?4",
+    )?;
+    stmt.query_map(
+        params![query_blob, model, query_vec.len() as i64, limit as i64],
+        |row| row.get::<_, String>(0),
+    )?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(Into::into)
+}
+
+fn sparse_candidates(
+    conn: &Connection,
+    query_sparse: &SparseVector,
+    limit: usize,
+) -> anyhow::Result<HashMap<String, f64>> {
+    if query_sparse.indices.is_empty() || limit == 0 {
+        return Ok(HashMap::new());
+    }
+    let mut scores = HashMap::<String, f64>::new();
+    let mut stmt =
+        conn.prepare("SELECT memory_id, weight FROM embedding_sparse WHERE token_id = ?")?;
+    for (token_id, query_weight) in query_sparse.indices.iter().zip(query_sparse.values.iter()) {
+        let token_id =
+            i64::try_from(*token_id).context("sparse query token id exceeds sqlite i64")?;
+        let rows = stmt.query_map([token_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })?;
+        for row in rows {
+            let (id, doc_weight) = row?;
+            *scores.entry(id).or_default() += f64::from(*query_weight) * doc_weight;
+        }
+    }
+    let mut ranked: Vec<_> = scores.into_iter().collect();
+    ranked.sort_by(|(id_a, score_a), (id_b, score_b)| {
+        score_b.total_cmp(score_a).then_with(|| id_a.cmp(id_b))
+    });
+    ranked.truncate(limit);
+    Ok(ranked
+        .into_iter()
+        .map(|(id, score)| (id, score.clamp(0.0, 1.0)))
+        .collect())
 }
 
 fn fts_candidates(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<String>> {
@@ -1575,7 +1746,8 @@ fn compute_components(
     conn: &Connection,
     memory: &MemoryRow,
     query: &str,
-    query_vec: &[f32],
+    query_embedding: &QueryEmbedding<'_>,
+    sparse_candidate_score: Option<f64>,
     context_tags: &[String],
 ) -> anyhow::Result<ScoreComponents> {
     let keyword = lexical_score(query, &memory.content);
@@ -1590,7 +1762,14 @@ fn compute_components(
         0.0
     };
     let vector = embedding_for(conn, &memory.id)?
-        .map(|v| f64::from(embed::cosine(query_vec, &v)).max(0.0))
+        .map(|v| f64::from(embed::cosine(query_embedding.dense, &v)).max(0.0))
+        .unwrap_or(0.0);
+    let sparse = match sparse_candidate_score {
+        Some(score) => score,
+        None => sparse_score_for(conn, &memory.id, query_embedding.sparse)?,
+    };
+    let colbert = colbert_for(conn, &memory.id)?
+        .map(|doc| colbert_score(query_embedding.colbert, &doc))
         .unwrap_or(0.0);
     let tag_overlap = if context_tags.is_empty() {
         0.0
@@ -1604,6 +1783,8 @@ fn compute_components(
     let context_bonus = (tag_overlap * 0.10).min(0.10);
     Ok(ScoreComponents {
         vector,
+        sparse,
+        colbert,
         keyword,
         ppr: 0.0,
         tag_overlap,
@@ -1625,6 +1806,60 @@ fn embedding_for(conn: &Connection, id: &str) -> anyhow::Result<Option<Vec<f32>>
         )
         .optional()?;
     blob.map(|b| embed::blob_to_vector(&b)).transpose()
+}
+
+fn sparse_score_for(
+    conn: &Connection,
+    id: &str,
+    query_sparse: &SparseVector,
+) -> anyhow::Result<f64> {
+    if query_sparse.indices.is_empty() {
+        return Ok(0.0);
+    }
+    let mut score = 0.0;
+    let mut stmt =
+        conn.prepare("SELECT weight FROM embedding_sparse WHERE memory_id = ? AND token_id = ?")?;
+    for (token_id, query_weight) in query_sparse.indices.iter().zip(query_sparse.values.iter()) {
+        let token_id =
+            i64::try_from(*token_id).context("sparse query token id exceeds sqlite i64")?;
+        let doc_weight: Option<f64> = stmt
+            .query_row(params![id, token_id], |row| row.get(0))
+            .optional()?;
+        if let Some(doc_weight) = doc_weight {
+            score += f64::from(*query_weight) * doc_weight;
+        }
+    }
+    Ok(score.clamp(0.0, 1.0))
+}
+
+fn colbert_for(conn: &Connection, id: &str) -> anyhow::Result<Option<Vec<Vec<f32>>>> {
+    let mut stmt =
+        conn.prepare("SELECT vec FROM embedding_colbert WHERE memory_id = ? ORDER BY token_index")?;
+    let rows = stmt
+        .query_map([id], |row| row.get::<_, Vec<u8>>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    rows.into_iter()
+        .map(|blob| embed::blob_to_vector(&blob))
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map(Some)
+}
+
+fn colbert_score(query: &[Vec<f32>], doc: &[Vec<f32>]) -> f64 {
+    if query.is_empty() || doc.is_empty() {
+        return 0.0;
+    }
+    let mut total = 0.0_f32;
+    for query_vector in query {
+        let best = doc
+            .iter()
+            .map(|doc_vector| embed::cosine(query_vector, doc_vector))
+            .fold(0.0_f32, f32::max);
+        total += best;
+    }
+    f64::from(total / query.len() as f32).clamp(0.0, 1.0)
 }
 
 fn lexical_score(query: &str, content: &str) -> f64 {
@@ -1650,6 +1885,8 @@ fn recency_score(updated_at: &str) -> f64 {
 
 fn score_components(weights: &crate::config::RecallWeights, c: &ScoreComponents) -> f64 {
     weights.vector * c.vector
+        + weights.sparse * c.sparse
+        + weights.colbert * c.colbert
         + weights.keyword * c.keyword
         + weights.ppr * c.ppr
         + weights.tag_overlap * c.tag_overlap

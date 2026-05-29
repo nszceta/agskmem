@@ -6,8 +6,19 @@ use tempfile::TempDir;
 fn app() -> (TempDir, AgskMem) {
     let tmp = TempDir::new().expect("tempdir");
     let mut cfg = Config::default();
+    cfg.embed.provider = "local".to_string();
+    cfg.embed.model = "local-hash-v1".to_string();
+    cfg.embed.dims = 128;
     cfg.db.path = tmp.path().join("agskmem.sqlite3");
     (tmp, AgskMem::open(cfg).expect("open app"))
+}
+
+#[test]
+fn default_embedding_provider_is_fastembed_bgem3_hybrid() {
+    let cfg = Config::default();
+    assert_eq!(cfg.embed.provider, "fastembed-bgem3");
+    assert_eq!(cfg.embed.model, "BGEM3Q");
+    assert_eq!(cfg.embed.dims, 1024);
 }
 
 fn assert_mcp_memory_is_compact(memory: &Value) {
@@ -194,8 +205,15 @@ fn empty_optional_ids_are_treated_as_absent() {
     let results = page["results"].as_array().expect("results");
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["id"].as_str(), Some(stored.ids[0].as_str()));
-}
 
+    let reembedded = app
+        .reembed(ReembedArgs {
+            memory_id: Some(String::new()),
+            ..Default::default()
+        })
+        .expect("blank reembed id means reembed all");
+    assert_eq!(reembedded["reembedded"], 1);
+}
 #[test]
 fn superseded_memories_are_hidden_by_default() {
     let (_tmp, app) = app();
@@ -367,6 +385,215 @@ fn graph_related_uses_associated_edges() {
         .expect("mcp related memory");
     assert_mcp_memory_is_compact(&mcp_memory["memory"]);
     assert_eq!(app.graph_stats()["directed_edges"], 1);
+}
+
+#[test]
+fn forward_push_propagates_and_normalizes_graph_scores() {
+    use agskmem::RelationKind;
+    use agskmem::graph::Graph;
+    use std::collections::HashMap;
+
+    let graph = Graph::from_edges(vec![
+        (
+            "seed".to_string(),
+            "direct".to_string(),
+            RelationKind::Exemplifies,
+            1.0,
+            1.0,
+        ),
+        (
+            "direct".to_string(),
+            "second".to_string(),
+            RelationKind::Exemplifies,
+            1.0,
+            1.0,
+        ),
+        (
+            "seed".to_string(),
+            "weak".to_string(),
+            RelationKind::Exemplifies,
+            0.25,
+            1.0,
+        ),
+    ]);
+
+    let ranks = graph.forward_push(
+        &HashMap::from([("seed".to_string(), 1.0_f32)]),
+        0.15,
+        1.0e-6,
+        100,
+    );
+
+    for id in ["seed", "direct", "second", "weak"] {
+        assert!(
+            ranks.get(id).copied().unwrap_or_default() > 0.0,
+            "{id} was not reached by forward push: {ranks:?}"
+        );
+    }
+    let total = ranks.values().sum::<f32>();
+    assert!((total - 1.0).abs() < 1.0e-5, "rank total was {total}");
+    assert!(
+        ranks["direct"] + ranks["second"] > ranks["weak"],
+        "stronger path should receive more rank mass than weak edge: {ranks:?}"
+    );
+}
+
+#[test]
+fn recall_expansion_uses_forward_push_scores() {
+    let (_tmp, app) = app();
+    let seed = app
+        .store_memory(StoreMemoryArgs {
+            content: Some("Project Falcon uses the cobalt adapter.".to_string()),
+            ..Default::default()
+        })
+        .expect("store seed")
+        .ids[0]
+        .clone();
+    let related = app
+        .store_memory(StoreMemoryArgs {
+            content: Some("Unrelated satellite maintenance window.".to_string()),
+            ..Default::default()
+        })
+        .expect("store related")
+        .ids[0]
+        .clone();
+    app.associate_memories(AssociateArgs {
+        memory1_id: seed,
+        memory2_id: related.clone(),
+        relation_type: "EXEMPLIFIES".to_string(),
+        strength: Some(1.0),
+        confidence: Some(1.0),
+        metadata: None,
+    })
+    .expect("associate");
+
+    let recall = app
+        .recall_memory(RecallArgs {
+            query: Some("cobalt adapter".to_string()),
+            expand_relations: true,
+            limit: Some(10),
+            ..Default::default()
+        })
+        .expect("expanded recall");
+    let results = recall["results"].as_array().expect("results");
+    let expanded = results
+        .iter()
+        .find(|row| row["id"] == related)
+        .expect("related memory should be present through graph expansion");
+    assert!(
+        expanded["components"]["ppr"].as_f64().unwrap_or_default() > 0.0,
+        "{expanded:?}"
+    );
+}
+
+#[test]
+fn hybrid_embeddings_store_and_score_sparse_and_colbert() {
+    let (_tmp, app) = app();
+    let id = app
+        .store_memory(StoreMemoryArgs {
+            content: Some(
+                "hybridneedle exact token validates sparse and colbert scoring.".to_string(),
+            ),
+            importance: Some(0.5),
+            confidence: Some(0.7),
+            ..Default::default()
+        })
+        .expect("store hybrid candidate")
+        .ids[0]
+        .clone();
+
+    let health = app.check_database_health().expect("health");
+    assert_eq!(health["missing_embeddings"], 0);
+    assert_eq!(health["missing_sparse_embeddings"], 0);
+    assert_eq!(health["missing_colbert_embeddings"], 0);
+    assert!(
+        health["counts"]["embedding_sparse"]
+            .as_i64()
+            .unwrap_or_default()
+            > 0,
+        "{health:?}"
+    );
+    assert!(
+        health["counts"]["embedding_colbert"]
+            .as_i64()
+            .unwrap_or_default()
+            > 0,
+        "{health:?}"
+    );
+
+    let recall = app
+        .recall_memory(RecallArgs {
+            query: Some("hybridneedle".to_string()),
+            limit: Some(5),
+            ..Default::default()
+        })
+        .expect("hybrid recall");
+    let hit = recall["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .find(|row| row["id"] == id)
+        .expect("stored hybrid candidate should be recalled");
+    assert!(
+        hit["components"]["sparse"].as_f64().unwrap_or_default() > 0.0,
+        "{hit:?}"
+    );
+    assert!(
+        hit["components"]["colbert"].as_f64().unwrap_or_default() > 0.0,
+        "{hit:?}"
+    );
+}
+
+#[test]
+fn ranked_recall_includes_vector_candidates_beyond_text_sources() {
+    let tmp = TempDir::new().expect("tempdir");
+    let mut cfg = Config::default();
+    cfg.embed.provider = "local".to_string();
+    cfg.embed.model = "local-hash-v1".to_string();
+    cfg.embed.dims = 128;
+    cfg.db.path = tmp.path().join("agskmem.sqlite3");
+    cfg.recall.per_source_limit = 1;
+    let app = AgskMem::open(cfg).expect("open app");
+
+    let id = app
+        .store_memory(StoreMemoryArgs {
+            content: Some("needlevectorunique".to_string()),
+            importance: Some(0.5),
+            confidence: Some(0.7),
+            ..Default::default()
+        })
+        .expect("store vector candidate")
+        .ids[0]
+        .clone();
+    app.store_memory(StoreMemoryArgs {
+        content: Some("fallback distractor row".to_string()),
+        ..Default::default()
+    })
+    .expect("store fallback distractor");
+
+    let recall = app
+        .recall_memory(RecallArgs {
+            query: Some(
+                "alpha00 alpha01 alpha02 alpha03 alpha04 alpha05 alpha06 alpha07 \
+                 alpha08 alpha09 alpha10 alpha11 alpha12 alpha13 alpha14 alpha15 \
+                 needlevectorunique"
+                    .to_string(),
+            ),
+            limit: Some(5),
+            ..Default::default()
+        })
+        .expect("recall vector candidate");
+    let hit = recall["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .find(|row| row["id"] == id)
+        .expect("stored vector candidate should be recalled");
+    assert!(
+        hit["components"]["vector"].as_f64().unwrap_or_default() > 0.0,
+        "{hit:?}"
+    );
+    assert_eq!(hit["components"]["exact_phrase"].as_f64(), Some(0.0));
 }
 
 #[test]

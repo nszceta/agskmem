@@ -40,6 +40,8 @@ pub struct RecallConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallWeights {
     pub vector: f64,
+    pub sparse: f64,
+    pub colbert: f64,
     pub keyword: f64,
     pub ppr: f64,
     pub tag_overlap: f64,
@@ -95,23 +97,25 @@ impl Default for Config {
                 path: default_db_path(),
             },
             embed: EmbedConfig {
-                provider: "local".to_string(),
-                model: "local-hash-v1".to_string(),
-                dims: 128,
+                provider: "fastembed-bgem3".to_string(),
+                model: "BGEM3Q".to_string(),
+                dims: 1024,
                 recall_model: String::new(),
                 base_url: String::new(),
                 api_key_env: "OPENAI_API_KEY".to_string(),
             },
             recall: RecallConfig {
                 weights: RecallWeights {
-                    vector: 0.30,
-                    keyword: 0.25,
-                    ppr: 0.15,
-                    tag_overlap: 0.10,
-                    exact_phrase: 0.05,
-                    importance: 0.05,
-                    recency: 0.05,
-                    confidence: 0.03,
+                    vector: 0.20,
+                    sparse: 0.15,
+                    colbert: 0.20,
+                    keyword: 0.15,
+                    ppr: 0.10,
+                    tag_overlap: 0.05,
+                    exact_phrase: 0.03,
+                    importance: 0.04,
+                    recency: 0.04,
+                    confidence: 0.02,
                     reliability: 0.02,
                 },
                 mmr_lambda: 0.7,
@@ -187,7 +191,24 @@ impl Config {
         if self.embed.dims == 0 || self.embed.dims > 4096 {
             bail!("embed.dims must be between 1 and 4096");
         }
+        match self.embed.provider.trim().to_ascii_lowercase().as_str() {
+            "local" | "local-hash" => {}
+            "fastembed" | "fastembed-bgem3" | "bge-m3" | "bgem3" => {
+                if !matches!(
+                    self.embed.model.trim(),
+                    "BGEM3Q" | "bge-m3-q" | "gpahal/bge-m3-onnx-int8"
+                ) {
+                    bail!("unsupported fastembed BGE-M3 model {}", self.embed.model);
+                }
+                if self.embed.dims != 1024 {
+                    bail!("fastembed BGE-M3 requires embed.dims = 1024");
+                }
+            }
+            other => bail!("unsupported embed.provider {other}"),
+        }
         let sum = self.recall.weights.vector
+            + self.recall.weights.sparse
+            + self.recall.weights.colbert
             + self.recall.weights.keyword
             + self.recall.weights.ppr
             + self.recall.weights.tag_overlap

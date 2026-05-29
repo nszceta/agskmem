@@ -1,11 +1,27 @@
+use anyhow::{Context, bail};
+use fastembed::{Bgem3Embedding, Bgem3InitOptions, Bgem3Model, SparseEmbedding};
 use sha2::{Digest, Sha256};
+use std::{collections::BTreeMap, sync::Mutex};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub trait Embedder: Send + Sync {
     fn model(&self) -> &str;
     fn dims(&self) -> usize;
-    fn embed_for_store(&self, texts: &[&str]) -> Vec<Vec<f32>>;
-    fn embed_for_recall(&self, texts: &[&str]) -> Vec<Vec<f32>>;
+    fn embed_for_store(&self, texts: &[&str]) -> anyhow::Result<EmbeddingBatch>;
+    fn embed_for_recall(&self, texts: &[&str]) -> anyhow::Result<EmbeddingBatch>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EmbeddingBatch {
+    pub dense: Vec<Vec<f32>>,
+    pub sparse: Vec<SparseVector>,
+    pub colbert: Vec<Vec<Vec<f32>>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SparseVector {
+    pub indices: Vec<usize>,
+    pub values: Vec<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -28,16 +44,140 @@ impl Embedder for LocalHashEmbedder {
         self.dims
     }
 
-    fn embed_for_store(&self, texts: &[&str]) -> Vec<Vec<f32>> {
-        texts
-            .iter()
-            .map(|text| hash_embed(text, self.dims))
-            .collect()
+    fn embed_for_store(&self, texts: &[&str]) -> anyhow::Result<EmbeddingBatch> {
+        let mut dense = Vec::with_capacity(texts.len());
+        let mut sparse = Vec::with_capacity(texts.len());
+        let mut colbert = Vec::with_capacity(texts.len());
+        for text in texts {
+            dense.push(hash_embed(text, self.dims));
+            sparse.push(local_sparse(text));
+            colbert.push(local_colbert(text, self.dims));
+        }
+        Ok(EmbeddingBatch {
+            dense,
+            sparse,
+            colbert,
+        })
     }
 
-    fn embed_for_recall(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+    fn embed_for_recall(&self, texts: &[&str]) -> anyhow::Result<EmbeddingBatch> {
         self.embed_for_store(texts)
     }
+}
+
+pub struct FastEmbedBgeM3Embedder {
+    model: String,
+    dims: usize,
+    bgem3_model: Bgem3Model,
+    inner: Mutex<Option<Bgem3Embedding>>,
+}
+
+impl FastEmbedBgeM3Embedder {
+    pub fn new(model: String, dims: usize) -> anyhow::Result<Self> {
+        let bgem3_model = parse_bgem3_model(&model)?;
+        Ok(Self {
+            model,
+            dims,
+            bgem3_model,
+            inner: Mutex::new(None),
+        })
+    }
+}
+
+impl Embedder for FastEmbedBgeM3Embedder {
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn dims(&self) -> usize {
+        self.dims
+    }
+    fn embed_for_store(&self, texts: &[&str]) -> anyhow::Result<EmbeddingBatch> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fastembed BGE-M3 embedder mutex poisoned"))?;
+        if guard.is_none() {
+            *guard = Some(Bgem3Embedding::try_new(Bgem3InitOptions::new(
+                self.bgem3_model.clone(),
+            ))?);
+        }
+        let inner = guard
+            .as_mut()
+            .context("fastembed BGE-M3 embedder was not initialized")?;
+        let output = inner.embed(texts, Some(8))?;
+        validate_dense_dims(&output.dense, self.dims)?;
+        Ok(EmbeddingBatch {
+            dense: output.dense,
+            sparse: output
+                .sparse
+                .into_iter()
+                .map(sparse_from_fastembed)
+                .collect(),
+            colbert: output.colbert,
+        })
+    }
+
+    fn embed_for_recall(&self, texts: &[&str]) -> anyhow::Result<EmbeddingBatch> {
+        self.embed_for_store(texts)
+    }
+}
+
+fn parse_bgem3_model(model: &str) -> anyhow::Result<Bgem3Model> {
+    match model.trim() {
+        "BGEM3Q" | "bge-m3-q" | "gpahal/bge-m3-onnx-int8" => Ok(Bgem3Model::BGEM3Q),
+        other => bail!("unsupported fastembed BGE-M3 model {other}"),
+    }
+}
+
+fn validate_dense_dims(vectors: &[Vec<f32>], expected: usize) -> anyhow::Result<()> {
+    for (i, vector) in vectors.iter().enumerate() {
+        if vector.len() != expected {
+            bail!(
+                "fastembed BGE-M3 returned {} dims for vector {i}, expected {expected}",
+                vector.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn sparse_from_fastembed(value: SparseEmbedding) -> SparseVector {
+    SparseVector {
+        indices: value.indices,
+        values: value.values,
+    }
+}
+
+fn local_sparse(text: &str) -> SparseVector {
+    let mut weights = BTreeMap::<usize, f32>::new();
+    for token in text.unicode_words().map(|w| w.to_ascii_lowercase()) {
+        if token.is_empty() {
+            continue;
+        }
+        *weights.entry(sparse_token_id(&token)).or_default() += 1.0;
+    }
+    let mut indices = Vec::with_capacity(weights.len());
+    let mut values = Vec::with_capacity(weights.len());
+    for (index, value) in weights {
+        indices.push(index);
+        values.push(value);
+    }
+    SparseVector { indices, values }
+}
+
+fn local_colbert(text: &str, dims: usize) -> Vec<Vec<f32>> {
+    text.unicode_words()
+        .map(|w| w.to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .map(|token| hash_embed(&token, dims))
+        .collect()
+}
+
+fn sparse_token_id(token: &str) -> usize {
+    let digest = Sha256::digest(token.as_bytes());
+    (u64::from_le_bytes(digest[0..8].try_into().expect("sha256 has 32 bytes"))
+        & 0x7fff_ffff_ffff_ffff) as usize
 }
 
 pub fn hash_embed(text: &str, dims: usize) -> Vec<f32> {

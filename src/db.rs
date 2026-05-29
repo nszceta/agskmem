@@ -65,6 +65,12 @@ impl Database {
                 "0002_governance_enrichment.sql",
                 include_str!("../migrations/0002_governance_enrichment.sql"),
             )?;
+            apply_migration(
+                &conn,
+                3,
+                "0003_hybrid_embeddings.sql",
+                include_str!("../migrations/0003_hybrid_embeddings.sql"),
+            )?;
             Ok(())
         })();
         match result {

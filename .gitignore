@@ -22,3 +22,4 @@ target/
 *.bak
 
 # Cargo.lock is intentionally tracked for this binary crate.
+.fastembed_cache/

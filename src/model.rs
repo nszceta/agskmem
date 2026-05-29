@@ -224,6 +224,8 @@ pub struct MemoryRow {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ScoreComponents {
     pub vector: f64,
+    pub sparse: f64,
+    pub colbert: f64,
     pub keyword: f64,
     pub ppr: f64,
     pub tag_overlap: f64,

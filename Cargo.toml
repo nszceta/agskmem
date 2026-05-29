@@ -10,6 +10,7 @@ arc-swap = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
+fastembed = { version = "5.14.0", default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }
 hex = "0.4"
 regex = "1"
 rmcp = { version = "1.7", default-features = true, features = ["transport-io"] }
