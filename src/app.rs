@@ -56,9 +56,13 @@ fn build_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
             config.embed.model.clone(),
             config.embed.dims,
         ))),
-        "fastembed" | "fastembed-bgem3" | "bge-m3" | "bgem3" => Ok(Arc::new(
-            FastEmbedBgeM3Embedder::new(config.embed.model.clone(), config.embed.dims)?,
-        )),
+        "fastembed" | "fastembed-bgem3" | "bge-m3" | "bgem3" => {
+            Ok(Arc::new(FastEmbedBgeM3Embedder::new(
+                config.embed.model.clone(),
+                config.embed.dims,
+                config.embed.cache_dir.clone(),
+            )?))
+        }
         other => bail!("unsupported embed.provider {other}"),
     }
 }

@@ -48,6 +48,7 @@ Default embeddings use local BGE-M3 through fastembed; classification remains lo
 
 - `embed.provider = "fastembed-bgem3"`, `embed.model = "BGEM3Q"`, `embed.dims = 1024`.
 - BGE-M3 uses fastembed 5.14's `Bgem3Embedding` over `gpahal/bge-m3-onnx-int8`; agskmem stores dense, sparse, and ColBERT outputs. Dense vectors remain in `embedding`, sparse token weights in `embedding_sparse`, and ColBERT token vectors in `embedding_colbert`.
+- Fastembed model files default to `embed.cache_dir = "$XDG_CACHE_HOME/agskmem/fastembed"` (or `~/.cache/agskmem/fastembed`) so model downloads do not create `.fastembed_cache` directories in whichever working directory launched agskmem.
 - `classification.provider = "local"` with a deterministic local classifier and `classification_cache`.
 - `content.soft_limit_bytes = 500`, `content.hard_limit_bytes = 2000`, `content.auto_summarize = true`, `content.summary_target_chars = 300`.
 - Recall weights are vector `0.20`, sparse `0.15`, ColBERT `0.20`, keyword `0.15`, PPR `0.10`, tag overlap `0.05`, exact phrase `0.03`, importance `0.04`, recency `0.04`, confidence `0.02`, reliability `0.02`.

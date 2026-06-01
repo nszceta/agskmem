@@ -1,7 +1,7 @@
 use anyhow::{Context, bail};
 use fastembed::{Bgem3Embedding, Bgem3InitOptions, Bgem3Model, SparseEmbedding};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, sync::Mutex};
+use std::{collections::BTreeMap, path::PathBuf, sync::Mutex};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub trait Embedder: Send + Sync {
@@ -69,18 +69,24 @@ pub struct FastEmbedBgeM3Embedder {
     model: String,
     dims: usize,
     bgem3_model: Bgem3Model,
+    cache_dir: PathBuf,
     inner: Mutex<Option<Bgem3Embedding>>,
 }
 
 impl FastEmbedBgeM3Embedder {
-    pub fn new(model: String, dims: usize) -> anyhow::Result<Self> {
+    pub fn new(model: String, dims: usize, cache_dir: PathBuf) -> anyhow::Result<Self> {
         let bgem3_model = parse_bgem3_model(&model)?;
         Ok(Self {
             model,
             dims,
             bgem3_model,
+            cache_dir,
             inner: Mutex::new(None),
         })
+    }
+
+    fn init_options(&self) -> Bgem3InitOptions {
+        Bgem3InitOptions::new(self.bgem3_model.clone()).with_cache_dir(self.cache_dir.clone())
     }
 }
 
@@ -98,9 +104,7 @@ impl Embedder for FastEmbedBgeM3Embedder {
             .lock()
             .map_err(|_| anyhow::anyhow!("fastembed BGE-M3 embedder mutex poisoned"))?;
         if guard.is_none() {
-            *guard = Some(Bgem3Embedding::try_new(Bgem3InitOptions::new(
-                self.bgem3_model.clone(),
-            ))?);
+            *guard = Some(Bgem3Embedding::try_new(self.init_options())?);
         }
         let inner = guard
             .as_mut()
@@ -243,4 +247,18 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
     let dot = a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
     dot.clamp(-1.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fastembed_bgem3_init_uses_configured_cache_dir() {
+        let cache_dir = PathBuf::from("/tmp/agskmem-fastembed-cache-test");
+        let embedder = FastEmbedBgeM3Embedder::new("BGEM3Q".to_string(), 1024, cache_dir.clone())
+            .expect("valid BGE-M3 embedder");
+
+        assert_eq!(embedder.init_options().cache_dir, cache_dir);
+    }
 }

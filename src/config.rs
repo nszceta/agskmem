@@ -27,6 +27,8 @@ pub struct EmbedConfig {
     pub recall_model: String,
     pub base_url: String,
     pub api_key_env: String,
+    #[serde(default = "default_fastembed_cache_dir")]
+    pub cache_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +105,7 @@ impl Default for Config {
                 recall_model: String::new(),
                 base_url: String::new(),
                 api_key_env: "OPENAI_API_KEY".to_string(),
+                cache_dir: default_fastembed_cache_dir(),
             },
             recall: RecallConfig {
                 weights: RecallWeights {
@@ -203,6 +206,9 @@ impl Config {
                 if self.embed.dims != 1024 {
                     bail!("fastembed BGE-M3 requires embed.dims = 1024");
                 }
+                if self.embed.cache_dir.as_os_str().is_empty() {
+                    bail!("fastembed cache_dir must not be empty");
+                }
             }
             other => bail!("unsupported embed.provider {other}"),
         }
@@ -253,6 +259,7 @@ struct PartialEmbedConfig {
     recall_model: Option<String>,
     base_url: Option<String>,
     api_key_env: Option<String>,
+    cache_dir: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 struct PartialRecallConfig {
@@ -321,6 +328,9 @@ fn merge_defaults(partial: PartialConfig) -> Config {
         }
         if let Some(v) = embed.api_key_env {
             cfg.embed.api_key_env = v;
+        }
+        if let Some(v) = embed.cache_dir {
+            cfg.embed.cache_dir = expand_home(&v);
         }
     }
     if let Some(recall) = partial.recall {
@@ -424,6 +434,39 @@ pub fn default_db_path() -> PathBuf {
     base.join("agskmem/agskmem.sqlite3")
 }
 
+pub fn default_fastembed_cache_dir() -> PathBuf {
+    let agskmem_cache_dir = env::var("AGSKMEM_FASTEMBED_CACHE_DIR").ok();
+    let fastembed_cache_dir = env::var("FASTEMBED_CACHE_DIR").ok();
+    let cache_base = env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::cache_dir);
+    default_fastembed_cache_dir_from(
+        agskmem_cache_dir.as_deref(),
+        fastembed_cache_dir.as_deref(),
+        cache_base,
+    )
+}
+
+fn default_fastembed_cache_dir_from(
+    agskmem_cache_dir: Option<&str>,
+    fastembed_cache_dir: Option<&str>,
+    cache_base: Option<PathBuf>,
+) -> PathBuf {
+    if let Some(path) = agskmem_cache_dir
+        && !path.trim().is_empty()
+    {
+        return expand_home(path);
+    }
+    if let Some(path) = fastembed_cache_dir
+        && !path.trim().is_empty()
+    {
+        return expand_home(path);
+    }
+    cache_base
+        .unwrap_or_else(|| expand_home("~/.cache"))
+        .join("agskmem/fastembed")
+}
+
 pub fn expand_home(path: &str) -> PathBuf {
     if let Some(stripped) = path.strip_prefix("~/")
         && let Some(home) = dirs::home_dir()
@@ -431,4 +474,63 @@ pub fn expand_home(path: &str) -> PathBuf {
         return home.join(stripped);
     }
     PathBuf::from(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_fastembed_cache_dir_is_xdg_scoped_when_unset() {
+        let dir = default_fastembed_cache_dir_from(
+            None,
+            None,
+            Some(PathBuf::from("/tmp/agskmem-test-cache")),
+        );
+
+        assert_eq!(
+            dir,
+            PathBuf::from("/tmp/agskmem-test-cache/agskmem/fastembed")
+        );
+    }
+
+    #[test]
+    fn explicit_fastembed_cache_dir_still_overrides_default() {
+        let dir = default_fastembed_cache_dir_from(
+            None,
+            Some("/tmp/fastembed-explicit-cache"),
+            Some(PathBuf::from("/tmp/agskmem-test-cache")),
+        );
+
+        assert_eq!(dir, PathBuf::from("/tmp/fastembed-explicit-cache"));
+    }
+
+    #[test]
+    fn agskmem_fastembed_cache_dir_takes_precedence() {
+        let dir = default_fastembed_cache_dir_from(
+            Some("/tmp/agskmem-explicit-cache"),
+            Some("/tmp/fastembed-explicit-cache"),
+            Some(PathBuf::from("/tmp/agskmem-test-cache")),
+        );
+
+        assert_eq!(dir, PathBuf::from("/tmp/agskmem-explicit-cache"));
+    }
+
+    #[test]
+    fn embed_cache_dir_can_be_configured() {
+        let cfg = merge_defaults(
+            toml::from_str::<PartialConfig>(
+                r#"
+[embed]
+cache_dir = "/tmp/agskmem-configured-fastembed"
+"#,
+            )
+            .expect("valid config"),
+        );
+
+        assert_eq!(
+            cfg.embed.cache_dir,
+            PathBuf::from("/tmp/agskmem-configured-fastembed")
+        );
+    }
 }
