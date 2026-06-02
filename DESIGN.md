@@ -1,240 +1,616 @@
-# agskmem design
+# agskmem Oh My Pi extension design
+
+## Purpose
+
+agskmem integrates with Oh My Pi through a generated OMP extension module, not by modifying Oh My Pi source and not by exposing raw MCP tools as the default model-facing interface.
+
+The integration provides one user-global durable memory layer for OMP agents. It disables OMP's built-in memory backend, registers a small canonical tool surface, and enforces agskmem write policy in a wrapper that the model cannot accidentally bypass.
 
-agskmem is a single Rust MCP server backed by one user-global SQLite database. It replaces the old multi-process memory stack with one binary, one database file, and no required daemon, container, npm bridge, graph server, or vector server.
+## Design decisions
+
+- Do not patch `/home/adam/src/oh-my-pi`.
+- Treat agskmem as a user-global memory store.
+- Do not implement project scoping in the OMP extension.
+- Prefer an OMP extension module over raw MCP exposure.
+- Set OMP's built-in memory backend to `off` so the extension owns memory tools.
+- Register OMP-native model-facing tools: `retain`, `recall`, `reflect`, and `memory_edit`.
+- Keep agskmem's existing MCP server and `agskmem install omp` path intact for users who want raw MCP.
+- Add a separate installer mode for the extension wrapper.
 
-The core intent is boring local reliability:
-
-- SQLite is the source of truth.
-- FTS rows, embeddings, tag prefixes, entities, statements, recall metrics, temporal edges, and the in-memory graph are derived state and must be repairable.
-- Coding agents never pass raw embedding vectors; agskmem generates vectors server-side.
-- Memory writes should store durable user corrections, finalized decisions, and user-articulated patterns, not transient session summaries or speculation.
-- Existing facts should be corrected with `update_memory`; duplicates should be merged or superseded rather than accumulated.
-- Connections should be explicit and meaningful: causal, preference, provenance, invalidation, example, and containment links are preferred over vague hubs.
+## Architecture
 
-## Runtime shape
+```text
+agskmem install omp-plugin
+    │
+    ├─ writes ~/.omp/agent/extensions/agskmem/index.ts
+    ├─ merges ~/.omp/agent/settings.json with memory.backend = "off"
+    ├─ optionally disables raw agskmem MCP exposure in ~/.omp/agent/mcp.json
+    └─ bakes the agskmem binary path into the extension with env override
+
+OMP runtime
+    │
+    ├─ auto-loads ~/.omp/agent/extensions/agskmem/index.ts
+    ├─ extension registers retain / recall / reflect / memory_edit
+    ├─ tools call `agskmem tool <name> <json>` through OMP's extension exec API
+    └─ extension injects startup recall and enforces write policy
+```
 
-- `agskmem serve` runs a newline-delimited stdio MCP JSON-RPC server. `serve --http` is rejected in this build.
-- MCP `initialize` advertises protocol `2024-11-05`, tool capability, server info, and the server instructions.
-- `agskmem install <client>` writes or prints client configuration for supported agents. Client-specific installers refuse conflicting `agskmem` entries unless `--force` is supplied.
-- JSON-client installs write `mcpServers.agskmem` with stdio transport, `agskmem serve`, a 30-second timeout, and `enabled: true`.
-- TOML-client installs append `[mcp_servers.agskmem]`.
-- `agskmem export` and `agskmem import` use SQLite online backup. Export also writes a JSON manifest next to the backup.
-- `agskmem import-jsonl` imports memory rows from JSONL, skipping blank or content-less entries.
-- `agskmem import-automem` imports legacy JSON array or JSONL exports, updates existing rows by id, imports relations, ignores external vector stores, and repairs indexes when edges are added.
-- `agskmem reembed` and `agskmem repair` rebuild derived indexes from source tables.
+Raw MCP exposes many low-level tools and relies on instructions for correct behavior. The extension wrapper gives OMP agents a stable high-level contract and hides internal/admin operations from normal agent use.
+
+The canonical model-facing contract is:
+
+```text
+retain      durable write
+recall      retrieval
+reflect     deeper graph-backed memory review
+memory_edit revise/delete/relate by id
+```
+
+The wrapper validates inputs before agskmem sees them, rejects forbidden embedding/vector fields, blocks low-level raw MCP writes when detected, and avoids adding scope metadata that agskmem did not receive explicitly.
+
+## Installer
 
-The default database path is `${AGSKMEM_DB:-${XDG_DATA_HOME:-~/.local/share}/agskmem/agskmem.sqlite3}`. The default config path is `${XDG_CONFIG_HOME:-~/.config}/agskmem/config.toml` when the platform reports a config directory.
+### Command
+
+The installer adds a new target:
 
-Config is loaded as defaults, optional TOML file overrides, then `AGSKMEM_DB`, CLI `--db`, and `AGSKMEM_LOG_LEVEL`. Validation rejects invalid embedding dimensions, recall weights that do not sum to 1, zero hard content limit, and soft content limits above hard limits.
+```bash
+agskmem install omp-plugin
+```
 
-## Agent memory policy
+Supported flags:
+
+```text
+--force             overwrite conflicting generated extension/settings entries
+--keep-raw-mcp      do not disable an existing OMP agskmem MCP entry
+--no-settings       write extension only; do not modify settings.json
+--bin PATH          bake PATH as the agskmem binary used by the extension
+```
 
-The MCP server instructions and installed policy are part of the design:
+### Default behavior
+
+1. Resolve the agskmem binary path:
+   - prefer `--bin`,
+   - otherwise use `std::env::current_exe()`,
+   - keep runtime override through `AGSKMEM_BIN` in the generated extension.
+2. Create `~/.omp/agent/extensions/agskmem/index.ts`.
+3. Merge `~/.omp/agent/settings.json` with:
+
+   ```json
+   {
+     "memory": {
+       "backend": "off"
+     }
+   }
+   ```
 
-- Use `startup_recall` at the start of coding sessions.
-- During long sessions, revisit memory context roughly every five user-assistant rounds with `recall_memory` or `startup_recall` as appropriate.
-- Use `recall_memory` before explicit memory questions and before decisions that may depend on prior preferences, corrections, project decisions, or patterns.
-- Treat `tags` as hard filters and `context_tags` as soft boosts.
-- Use canonical project slug tags for project-specific memories.
-- Store stable corrections, finalized decisions, and user-articulated patterns.
-- Do not store transient session summaries or speculative notes.
-- Use `associate_memories` for durable causal, preference, provenance, invalidation, and example links.
-- Use `update_memory` for corrections to an existing fact.
-- Bulk tag deletes require `delete_memory` dry-run first and then the returned `confirmation_token`.
+4. If `~/.omp/agent/mcp.json` contains `mcpServers.agskmem`, disable that entry unless `--keep-raw-mcp` is passed:
 
-## Configuration defaults
+   ```json
+   {
+     "mcpServers": {
+       "agskmem": {
+         "enabled": false
+       }
+     }
+   }
+   ```
+
+5. Create timestamped backups before changing existing files.
+6. Refuse to overwrite a non-generated `~/.omp/agent/extensions/agskmem/index.ts` unless `--force` is provided.
+7. Emit JSON output listing changed files.
+
+### Generated extension marker
+
+The generated file starts with:
+
+```ts
+// Generated by agskmem install omp-plugin. Do not edit by hand.
+// agskmem-plugin-version: 1
+```
+
+The installer may overwrite files with this marker. It must not silently overwrite unmarked files.
+
+## Extension runtime
+
+The generated extension exports a default OMP extension factory:
+
+```ts
+export default (api) => {
+  api.registerTool(...retain...);
+  api.registerTool(...recall...);
+  api.registerTool(...reflect...);
+  api.registerTool(...memory_edit...);
+  api.registerCommand("agskmem", ...);
+  api.on("session_start", ...);
+  api.on("before_agent_start", ...);
+  api.on("tool_call", ...);
+  api.on("turn_end", ...);
+};
+```
+
+The generated TypeScript should use no imports if practical. It should use `api.zod` for schemas and `api.exec()` for agskmem calls so the generated file remains portable across OMP installs.
+
+The generated file contains a small runtime config object:
+
+```ts
+const CONFIG = {
+  agskmemBin: process.env.AGSKMEM_BIN || "/absolute/path/to/agskmem",
+  autoRecall: process.env.AGSKMEM_OMP_AUTO_RECALL !== "0",
+  autoRetain: process.env.AGSKMEM_OMP_AUTO_RETAIN === "1",
+  recallLimit: Number(process.env.AGSKMEM_OMP_RECALL_LIMIT || 10),
+  blockRawMcpWrites: process.env.AGSKMEM_OMP_BLOCK_RAW_MCP_WRITES !== "0",
+};
+```
+
+Environment variables provide lightweight overrides without another OMP settings schema.
+
+## agskmem command boundary
+
+All wrapper tools execute agskmem through argv, never through shell interpolation:
+
+```bash
+$AGSKMEM_BIN tool <tool-name> '<json-args>'
+```
+
+The helper must:
+
+- pass JSON as an argv argument,
+- never use shell interpolation,
+- parse stdout as JSON,
+- return structured OMP `AgentToolResult`,
+- surface stderr/exit failures as tool errors,
+- redact nothing itself because agskmem remains responsible for output policy.
+
+Representative helper shape:
+
+```ts
+async function callAgskmem(ctx, toolName, args, signal) {
+  const result = await api.exec(agskmemBin(), ["tool", toolName, JSON.stringify(args)], {
+    cwd: ctx.cwd,
+    signal,
+  });
+  if (result.exitCode !== 0) return toolError(result.output);
+  return JSON.parse(result.output);
+}
+```
+
+## Model-facing tools
+
+### `retain`
+
+`retain` stores durable memory.
+
+Model-facing schema:
+
+```text
+content: string                       required
+summary?: string
+kind?: Decision | Pattern | Preference | Style | Habit | Insight | Context | Statement
+importance?: number                   0.0..1.0
+confidence?: number                   0.0..1.0
+tags?: string[]                       explicit only; no automatic project tags
+metadata?: object
+id?: string
+valid_from?: string
+valid_until?: string
+```
+
+Mapping:
+
+```text
+retain.kind       -> store_memory.type
+valid_from        -> t_valid
+valid_until       -> t_invalid
+source            -> "omp-extension:retain"
+backend tool      -> store_memory
+```
+
+Defaults:
+
+```text
+kind       = Statement
+importance = agskmem default
+confidence = agskmem default
+tags       = user/model supplied tags only
+```
+
+Validation rejects:
+
+- empty content,
+- transient session summaries,
+- TODO/planning noise unless the user explicitly asks to remember it,
+- project tags, path tags, or other automatically derived scope tags,
+- forbidden embedding/vector fields at any nesting depth.
+
+Forbidden field names are:
+
+```text
+embedding
+embeddings
+embedding_vector
+vector
+vectors
+vec
+dense
+sparse
+colbert
+```
+
+### `recall`
+
+`recall` retrieves relevant memory.
+
+Model-facing schema:
+
+```text
+query?: string
+memory_id?: string
+tags?: string[]
+exclude_tags?: string[]
+limit?: number                         default 10, max 50
+current_only?: boolean                 default true
+expand_relations?: boolean             default true
+relation_limit?: number                default 20
+as_of?: string
+start?: string
+end?: string
+```
+
+Mapping:
+
+```text
+recall -> recall_memory
+```
+
+Defaults:
+
+```text
+limit = 10
+current_only = true
+expand_relations = true
+relation_limit = 20
+active_path omitted
+context_tags omitted
+```
+
+The extension adds no scoping behavior.
+
+Output policy:
+
+- return concise readable memory entries,
+- include ids,
+- include relation snippets when present,
+- avoid verbose debug state unless explicitly requested.
+
+### `reflect`
+
+`reflect` performs deeper memory review over recall plus graph context.
+
+Model-facing schema:
+
+```text
+query: string                           required
+limit?: number                          default 12, max 50
+include_graph?: boolean                 default true
+include_trace?: boolean                 default false
+write_insights?: boolean                default false
+```
+
+Implementation:
+
+1. Call `recall_memory` with:
+
+   ```text
+   query
+   limit
+   expand_relations = true
+   relation_limit = 50
+   expansion_limit = 100
+   auto_decompose = true
+   ```
+
+2. If `include_graph` is enabled, call graph tools for high-signal returned ids:
+
+   ```text
+   graph_neighbors
+   get_related_memories
+   ```
+
+3. Return a structured reflection packet containing:
+   - directly recalled memories,
+   - related memories,
+   - reinforcing/contradicting edges,
+   - possible stale memories,
+   - exact ids to edit if correction is needed.
+4. Do not create new memories unless `write_insights = true`.
+5. If `write_insights = true`, store only insights directly supported by returned memory ids and include provenance in metadata.
+
+This keeps synthesis in the assistant and keeps the tool deterministic and grounded.
+
+### `memory_edit`
+
+`memory_edit` revises memory by id.
+
+Model-facing schema:
+
+```text
+action: update | delete | relate | invalidate
+memory_id?: string
+memory1_id?: string
+memory2_id?: string
+content?: string
+summary?: string
+kind?: Decision | Pattern | Preference | Style | Habit | Insight | Context | Statement
+importance?: number
+confidence?: number
+relevance?: number
+reliability?: number
+tags?: string[]
+metadata?: object
+relation_type?: RELATES_TO | LEADS_TO | OCCURRED_BEFORE | PREFERS_OVER | EXEMPLIFIES | CONTRADICTS | REINFORCES | INVALIDATED_BY | EVOLVED_INTO | DERIVED_FROM | PART_OF
+strength?: number
+reason?: string
+```
+
+Mapping:
+
+```text
+update     -> update_memory
+invalidate -> update_memory with archived/t_invalid or relation INVALIDATED_BY when target supplied
+delete     -> delete_memory by memory_id only
+relate     -> associate_memories
+```
+
+Validation:
+
+- `update`, `delete`, and `invalidate` require `memory_id`.
+- `relate` requires `memory1_id`, `memory2_id`, and `relation_type`.
+- Bulk delete by tag is not exposed.
+- Deleting by tags remains admin-only.
+- Forbidden embedding/vector fields are rejected recursively.
 
-Default embeddings use local BGE-M3 through fastembed; classification remains local:
+## Slash commands
 
-- `embed.provider = "fastembed-bgem3"`, `embed.model = "BGEM3Q"`, `embed.dims = 1024`.
-- BGE-M3 uses fastembed 5.14's `Bgem3Embedding` over `gpahal/bge-m3-onnx-int8`; agskmem stores dense, sparse, and ColBERT outputs. Dense vectors remain in `embedding`, sparse token weights in `embedding_sparse`, and ColBERT token vectors in `embedding_colbert`.
-- Fastembed model files default to `embed.cache_dir = "$XDG_CACHE_HOME/agskmem/fastembed"` (or `~/.cache/agskmem/fastembed`) so model downloads do not create `.fastembed_cache` directories in whichever working directory launched agskmem.
-- `classification.provider = "local"` with a deterministic local classifier and `classification_cache`.
-- `content.soft_limit_bytes = 500`, `content.hard_limit_bytes = 2000`, `content.auto_summarize = true`, `content.summary_target_chars = 300`.
-- Recall weights are vector `0.20`, sparse `0.15`, ColBERT `0.20`, keyword `0.15`, PPR `0.10`, tag overlap `0.05`, exact phrase `0.03`, importance `0.04`, recency `0.04`, confidence `0.02`, reliability `0.02`.
-- Recall uses `mmr_lambda = 0.7`, `per_source_limit = 200`, and `adaptive_floor = true`.
-- PPR uses `alpha = 0.15`, `epsilon = 1e-4`, `max_pushes = 50000`, CSR rebuild threshold `1024`, and CSR rebuild interval `60s`.
-- Decay uses base `0.005`, floor factor `0.10`, archive threshold `0.05`, delete threshold `0.01`, and grace window `30` days.
+The extension registers one user-facing slash command namespace:
 
-## Storage
+```text
+/agskmem stats
+/agskmem graph
+/agskmem repair
+/agskmem consolidate [dry-run|run]
+/agskmem recall <query>
+/agskmem doctor
+```
 
-The migrations create:
+These commands are for the user, not normal model use.
 
-- `meta`: schema/app/embedding metadata.
-- `schema_history`: forward-only migration records with SHA-256 migration hashes; a hash mismatch aborts startup.
-- `memory`: canonical records with UUID/string ids, content, summary, type, importance, confidence, relevance, reliability, metadata, source, timestamps, validity windows, archived flag, and protected flag.
-- `memory_fts`: external-content FTS5 index over memory content and summaries.
-- `tag`: normalized lower-case exact tags.
-- `tag_prefix`: derived prefixes for prefix-style tag lookup support.
-- `entity` and `memory_entity`: deterministic entity mentions.
-- `edge`: typed relationship graph edges with strength, confidence, metadata, and timestamps.
-- `statement` and `statement_fts`: extracted factual statements with provenance to source memories.
-- `embedding`: normalized little-endian `f32` vector blobs with model, dimension count, norm, and creation time.
-- `embedding_sparse`: BGE-M3 sparse lexical token weights by memory and token id.
-- `embedding_colbert`: BGE-M3 ColBERT token vectors by memory and token index.
-- `embedding_job`: retry queue for future embedders that cannot encode immediately.
-- `enrichment_job`: explicit re-enrichment queue.
-- `classification_cache`: content-hash keyed local classification cache.
-- `recall_metric`: recent recall timing/candidate metrics.
+Backend calls:
 
-Writers use a single mutex-protected SQLite writer. Migrations and canonical write tools use `BEGIN IMMEDIATE`; connections enable WAL, foreign keys, a busy timeout, in-memory temp store, and mmap on the writer. Mutating tools rebuild or republish derived graph/index state when needed.
+```text
+stats       -> analyze_memories + graph_stats + enrichment_status
+repair      -> repair_index
+graph       -> graph_stats or graph_snapshot
+consolidate -> consolidate
+recall      -> recall_memory
+doctor      -> check_database_health + graph_stats + enrichment_status
+```
 
-## Embeddings and content governance
+## Runtime enforcement
 
-`FastEmbedBgeM3Embedder` is the default embedder. It calls fastembed's BGE-M3 joint dense/sparse/ColBERT model in batches capped at 8 and stores all three outputs: dense 1024-dimensional vectors, sparse token weights, and ColBERT token vectors. `LocalHashEmbedder` remains available only as an explicit `embed.provider = "local"` fallback for tests and offline recovery. The blob codec rejects malformed `f32` blobs and dimension mismatches.
+### Built-in memory backend conflict
 
-Store/update content passes through governance:
+The installer sets:
 
-- Content above `hard_limit_bytes` is rejected.
-- Content above `soft_limit_bytes` is deterministically summarized when local auto-summarization is enabled.
-- Summarization metadata records original content, lengths, summary model, and creation time; skipped summarization is recorded.
-- Classification is explicit type first, then cache, then deterministic local marker rules. Classification metadata is stored with the memory.
+```json
+{"memory":{"backend":"off"}}
+```
 
-Memory types are `Decision`, `Pattern`, `Preference`, `Style`, `Habit`, `Insight`, `Context`, and `Statement`; `Memory` parses as `Context`.
+At `session_start`, the extension checks active tools if OMP exposes enough information. If it detects duplicate memory tools or an unexpected backend, it emits a warning and refuses to auto-inject memory context. This is fail-safe: no ambiguous memory layer.
 
-## Write path
+### Raw agskmem MCP conflict
 
-`store_memory` accepts top-level single-memory fields through the public MCP schema so tool logs show visible content. The internal Rust argument type also supports a batch `memories` vector for non-schema callers. Blank optional strings are treated as absent.
+The default installer disables raw MCP exposure. If raw MCP tools are still active, the `tool_call` hook blocks raw write/edit calls and instructs the model to use wrapper tools:
 
-For each stored memory agskmem:
+```text
+mcp__agskmem_store_memory       blocked; use retain
+mcp__agskmem_update_memory      blocked; use memory_edit
+mcp__agskmem_delete_memory      blocked; use memory_edit
+mcp__agskmem_associate_memories blocked; use memory_edit
+```
 
-1. chooses the provided id or a UUIDv7 id,
-2. applies content governance,
-3. classifies the memory,
-4. normalizes and inserts tags,
-5. stores the memory and embedding,
-6. extracts entities and statements,
-7. derives temporal `PRECEDED_BY` edges from shared entities within a seven-day window,
-8. commits the transaction,
-9. rebuilds derived indexes and republishes the graph.
+Read-only raw calls may remain allowed when the user passes `--keep-raw-mcp`.
 
-`update_memory` patches only provided fields. Content or summary changes re-embed and re-enrich the row. Tag changes replace tags, rebuild tag prefixes, and re-enrich. Metadata patches merge into existing metadata. Updates can set importance, confidence, relevance, reliability, source, validity windows, archived, and protected.
+### No embeddings from agents
 
-`delete_memory` deletes by id immediately. Bulk delete by tags is guarded by a dry-run confirmation token computed from the target ids. Deletion repairs indexes and graph state.
+Every wrapper tool runs `rejectForbiddenKeys(params)` before dispatch. This preserves agskmem's invariant that embeddings are generated server-side.
 
-`associate_memories` upserts only authorable relation kinds and requires both endpoints to exist.
+### No scoping
 
-## Recall
+The extension never derives tags or metadata from:
 
-`recall_memory` has three effective modes:
+```text
+cwd
+repo root
+project name
+file path
+session id
+subagent id
+```
 
-1. ID fetch by `memory_id`.
-2. Exact tag enumeration when no query is provided and tags are present.
-3. Ranked search.
+It may pass user/model-supplied tags exactly after agskmem normalization, but it does not add project tags automatically.
 
-Ranked search combines candidate sources:
+### Auto recall
 
-- dense embedding cosine search,
-- sparse token-weight search,
-- FTS5 keyword matches,
-- exact phrase matches,
-- entity matches,
-- recent/high-relevance fallback rows,
-- decomposed terms when `auto_decompose` is true,
-- caller `priority_ids`.
+Auto recall is enabled by default.
 
-Hard filters are applied before scoring: all requested tags, excluded tags, current-state semantics, `as_of`, `start`, `end`, `time_query`, and `time_range`. `queries[]` joins into a single query string. `context`, `language`, `active_path`, `context_types`, and `context_tags` enrich soft context tags used only for scoring.
+On `session_start` or first `before_agent_start`, the extension calls:
 
-Score components are computed from the candidate content and state, not from the retrieval path: dense vector cosine, sparse lexical score, ColBERT late-interaction score, lexical keyword overlap, PPR, tag overlap, exact phrase, importance, recency, confidence, reliability, and context bonus. Configured weights produce the final score. `priority_ids` bypass score-floor pruning. Hits can be sorted by score or time; broad score-sorted result sets use MMR to reduce near-duplicates. Returned memories are touched by updating `last_accessed`.
+```text
+startup_recall { limit: 10 }
+```
 
-Graph expansion is enabled by `expand_relations` or `expand_entities`; both currently seed the same PPR path. `expand_respect_tags` makes expanded nodes obey the original filters. `expand_min_importance` prunes low-importance expanded nodes.
+It injects a compact memory block into the next model context:
 
-Compatibility fields accepted by the MCP schema but not yet used for distinct behavior include `tag_mode`, `tag_match`, `relation_limit`, `expansion_limit`, and `expand_min_strength`. Current tag filtering is exact all-tag matching.
+```text
+<agskmem>
+Relevant durable memory from agskmem:
+- [id] summary/content
+...
+</agskmem>
+```
 
-`startup_recall` returns current, non-archived memories ordered by importance and update time. `trace_recall` runs normal recall and preserves score components in the compact MCP response.
+During long sessions, the extension refreshes roughly every five user-assistant rounds by calling `startup_recall` or `recall_memory` over recent user text. Injected text must remain compact.
 
-## Current-state semantics
+### Auto retain
 
-The default is `current_only=true`:
+Auto retain is disabled by default.
 
-- Archived memories are hidden.
-- Future `t_valid` memories are hidden.
-- Expired `t_invalid` memories are hidden.
-- Memories with active outgoing `INVALIDATED_BY` or `EVOLVED_INTO` replacements are hidden.
-- `CONTRADICTS` does not suppress by itself.
+The model should call `retain` explicitly when a user correction, preference, finalized decision, or durable pattern is stated. This avoids speculative memory writes.
 
-`current_only=false` can return non-active rows with state labels: `archived`, `future`, `expired`, `superseded`, or `active`.
+An optional future setting may enable conservative auto-retain:
 
-## Graph
+```text
+agskmem.autoRetain = conservative
+```
 
-Edges are stored in SQLite and loaded into an in-memory CSR cache. Readers use an `ArcSwap<Graph>` pointer, so recall reads do not take a graph lock. `repair_index` rebuilds the CSR from `edge` and atomically publishes the new graph.
+If added, it may store only explicit durable user statements and must never store inferred facts without clear provenance.
 
-The CSR stores id/node maps, row pointers, destination node indexes, relation kind, strength, and confidence. Adjacency lists are deterministic. Graph expansion uses a single-threaded forward-push Personalized PageRank implementation. Seed scores are normalized, edge mass is multiplied by relation default weight, clamped strength, and clamped confidence, and high-degree nodes naturally split mass across outgoing edges.
+## Source-level implementation shape
 
-Authorable relation kinds are:
+The Rust CLI adds `agskmem install omp-plugin` as the minimal preferred interface. Internally this can be represented as `Client::OmpPlugin` or an equivalent installer subcommand.
 
-- `RELATES_TO`
-- `LEADS_TO`
-- `OCCURRED_BEFORE`
-- `PREFERS_OVER`
-- `EXEMPLIFIES`
-- `CONTRADICTS`
-- `REINFORCES`
-- `INVALIDATED_BY`
-- `EVOLVED_INTO`
-- `DERIVED_FROM`
-- `PART_OF`
+Expected helpers:
 
-System-managed relation kinds are:
+```rust
+install_omp_plugin(force, keep_raw_mcp, no_settings, bin)
+write_omp_extension(path, bin)
+merge_omp_settings_backend_off(path, force)
+disable_omp_raw_mcp(path, force)
+backup_existing(path)
+```
 
-- `SIMILAR_TO`
-- `PRECEDED_BY`
-- `DISCOVERED`
-- `EXTRACTED_FROM`
+The generated TypeScript should live in a real template file rather than a giant inline Rust string:
 
-Graph tools expose direct neighbors, graph stats, a bounded snapshot, graph-only related-memory lookup, and PPR components through trace recall.
+```rust
+const OMP_PLUGIN_TEMPLATE: &str = include_str!("../templates/omp-agskmem-extension.ts");
+```
 
-## Enrichment and consolidation
+Template path:
 
-Store/update performs cheap deterministic enrichment inline:
+```text
+templates/omp-agskmem-extension.ts
+```
 
-- capitalized full-name-like entity mentions,
-- path-like entity mentions,
-- `entity:<kind>:<slug>` tags,
-- up to eight sentence-split statements,
-- statement rows with source-memory provenance,
-- temporal `PRECEDED_BY` edges for shared entities in a seven-day window.
+The installer substitutes:
 
-`repair_index` rebuilds memory FTS, statement FTS, tag prefixes, prunes orphan entities, rebuilds temporal edges, and republishes the graph.
+```text
+__AGSKMEM_BIN__
+__PLUGIN_VERSION__
+```
 
-Administrative consolidation supports explicit dry-run or mutating modes:
+## Required tests
 
-- `decay`: recomputes relevance from age, access recency, graph degree, importance, and confidence.
-- `forget`: archives or deletes unprotected, low-importance rows outside the grace window when relevance crosses configured thresholds.
-- `creative`: creates conservative `DISCOVERED` edges among high-relevance active memory pairs.
-- `cluster`: currently reports existing `SIMILAR_TO` edge count and does not create meta-patterns.
-- `all`: runs all modes.
+Rust tests cover:
 
-`consolidate_status` and `enrichment_status` expose persisted queue/metric state. They currently report no live background scheduler or worker. `enrichment_reprocess` queues selected ids for explicit reprocessing and can force replacement of existing queue entries.
+- generated extension marker detection,
+- refusal to overwrite unmarked extension without `--force`,
+- overwriting marked extension with `--force`,
+- settings merge preserving unrelated settings,
+- settings merge setting `memory.backend = off`,
+- raw MCP disable preserving server config and only setting `enabled=false`,
+- `--keep-raw-mcp` leaving MCP config unchanged,
+- generated extension containing the resolved binary path.
 
-## MCP tool surface
+If practical, add a generated-extension smoke test that:
 
-The server exposes AutoMem-compatible tool names:
+- installs into a temp HOME,
+- runs a Bun syntax check on generated `index.ts`,
+- uses a fake agskmem executable that records argv,
+- verifies wrapper calls pass JSON as argv instead of shell text.
 
-- Writes: `store_memory`, `update_memory`, `delete_memory`, `associate_memories`.
-- Reads: `recall_memory`, `startup_recall`, `get_related_memories`, `graph_snapshot`, `graph_neighbors`, `graph_stats`, `trace_recall`.
-- Introspection: `check_database_health`, `analyze_memories`, `relation_types`, `memory_types`.
-- Administration: `consolidate`, `consolidate_status`, `enrichment_status`, `enrichment_reprocess`, `repair_index`, `reembed`, `export_backup`, `import_backup`.
+## Acceptance criteria
 
-MCP recall-like responses are compact by default: noisy metadata, raw score components, and transport-only fields are omitted unless tracing/debug output is requested. Human-readable `results_text` is returned for recall-style tools.
+Running:
 
-## Memory stewardship intent
+```bash
+agskmem install omp-plugin --force
+```
 
-The memory graph should stay useful over time:
+creates or updates:
 
-- Normalize taxonomy and tags instead of allowing parallel synonyms.
-- Prefer stable project namespace tags such as `agskmem`, `moirai`, `opengrid`, and `capture_rs`.
-- Treat generated entity tags as recall aids, not canonical project tags.
-- Merge duplicate preferences into one stronger canonical memory.
-- Archive or delete weak transient notes that are not reusable for future decisions.
-- Use high-confidence explicit edges over many vague `RELATES_TO` links.
-- Link preferences to concrete examples with `EXEMPLIFIES`.
-- Link decisions to implementation outcomes with `DERIVED_FROM`.
-- Link superseded memories with `INVALIDATED_BY` or `EVOLVED_INTO`.
-- Avoid generic hubs unless the memory is truly foundational.
+```text
+~/.omp/agent/extensions/agskmem/index.ts
+~/.omp/agent/settings.json
+```
 
-## Security and privacy
+and produces JSON output listing changed files.
 
-agskmem keeps all data local. No telemetry leaves the machine. Provider keys, if non-local providers are added, are read from config/env and must never be logged. The active implementation does not require provider credentials.
+The implementation must not modify files under:
 
-Backups are SQLite backups; they contain the same private memory content as the live database and should be protected accordingly.
+```text
+/home/adam/src/oh-my-pi
+```
+
+After install, OMP config has:
+
+```json
+{"memory":{"backend":"off"}}
+```
+
+OMP exposes these model-facing tools from the extension:
+
+```text
+retain
+recall
+reflect
+memory_edit
+```
+
+Wrapper tools reject embedding/vector inputs and never pass them to agskmem.
+
+Wrapper tools do not add project tags, path tags, bank names, namespaces, or cwd-derived metadata.
+
+`retain` is explicit and validates that content is non-empty and plausible as durable memory. Auto-retain is off by default.
+
+On the first agent turn in a session, the extension injects compact startup recall context from agskmem.
+
+Default install disables OMP's raw agskmem MCP entry if present. Users can opt out with `--keep-raw-mcp`.
+
+## Verification
+
+Implementation verification runs:
+
+```bash
+cargo test
+```
+
+Manual smoke verification after implementation:
+
+```bash
+cargo build --release
+./target/release/agskmem install omp-plugin --force
+```
+
+Then start OMP and verify:
+
+```text
+- no built-in memory backend warning
+- retain / recall / reflect / memory_edit are available
+- startup memory block appears in context
+- retain writes to agskmem
+- recall reads from agskmem
+- memory_edit updates by id
+- raw MCP write calls are blocked or unavailable
+```
+
+## Future optional work
+
+These are not required for the initial integration:
+
+- OMP settings schema for agskmem plugin options.
+- Rich TUI renderers for graph output.
+- A first-class agskmem `reflect_memory` backend API.
+- Conservative LLM-assisted auto-retain.
+- Import/migration helpers from Mnemopi.
+- Admin-only graph visualization command.
